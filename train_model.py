@@ -1,13 +1,15 @@
 import argparse
 import pandas as pd
 import yaml
-from statsmodels.tsa.ar_model import AutoReg
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error
+from statsmodels.tsa.ar_model import AutoReg
 
 
-TRAIN_COLUMNS = ['Latest March Ice Reading', 'feb_low_temp', 'feb_high_temp', 'Latest March Date', 'feb_avg_temp', 'Latest Feb Date', 'Latest Feb Ice Reading']
+
+TRAIN_COLUMNS = ['Latest March Ice Reading', 'feb_low_temp', 'feb_high_temp', 'Latest March Date', 'feb_avg_temp']
+
 
 
 def main():
