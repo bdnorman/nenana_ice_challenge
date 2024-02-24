@@ -7,7 +7,7 @@ import numpy as np
 from sklearn.metrics import mean_squared_error
 
 
-TRAIN_COLUMNS = ['Latest Feb Ice Reading', 'feb_low_temp', 'feb_high_temp', 'prior_melt', 'Latest Feb Date', 'feb_avg_temp']
+TRAIN_COLUMNS = ['Latest March Ice Reading', 'feb_low_temp', 'feb_high_temp', 'Latest March Date', 'feb_avg_temp', 'Latest Feb Date', 'Latest Feb Ice Reading']
 
 
 def main():
