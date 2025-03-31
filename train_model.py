@@ -32,6 +32,7 @@ TRAIN_COLUMNS = [
     'march_avg_temp',
     "Latest Feb Ice Reading",
     "Latest Feb Date",
+    "march_avg_solar_radiation"
 ]
 
 def convert_decimal_day_to_date(decimal_day):
