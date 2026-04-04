@@ -2,136 +2,154 @@ import argparse
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import mean_squared_error
-from statsmodels.tsa.ar_model import AutoReg
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 from datetime import datetime, timedelta
 
 
-_PREDICTING_YEAR = 2025
+_PREDICTING_YEAR = 2026
 
-
-# Run this with 1 or 2 lag
-# TRAIN_COLUMNS = [
-#     "Latest March Ice Reading",
-#     "march_low_temp",
-#     "march_high_temp",
-#     # "Latest March Date",
-#     "feb_avg_temp",
-#     'march_avg_temp',
-#     "Latest Feb Ice Reading",
-#     # "Latest Feb Date",
-# ]
-
-# Run this lage of 3 for 3.17 day error
-TRAIN_COLUMNS = [
-    "Latest March Ice Reading",
-    # "march_low_temp",
-    # "march_high_temp",
-    "Latest March Date",
-    # "feb_avg_temp",
-    'march_avg_temp',
-    "Latest Feb Ice Reading",
-    "Latest Feb Date",
+# Features available before breakup (Feb/March measurements + climate teleconnections).
+# Note: AO and feb_avg_temp have near-zero correlation with breakup date in this dataset
+# and were excluded to reduce noise. Top correlations: Feb ice (+0.44), March ice (+0.39),
+# nino34_march (-0.38), pdo_march (-0.25), march_avg_temp (-0.17).
+FEATURE_COLUMNS = [
+    "Latest Feb Ice Reading",   # Feb ice thickness (inches) — strongest predictor
+    "Latest March Ice Reading", # March ice thickness (inches)
+    "ice_change",               # March - Feb ice (negative = ice melting by measurement day)
+    "march_avg_temp",           # March average temperature (°F)
+    "nino34_march",             # ENSO Nino 3.4: El Niño+ → warmer AK → earlier melt
+    "pdo_march",                # Pacific Decadal Oscillation: PDO+ → warmer AK → earlier melt
+    "prior_melt",               # Previous year's breakup day (AR1 component)
 ]
 
+
 def convert_decimal_day_to_date(decimal_day):
-    # Assuming a non-leap year starting on January 1
-    start_date = datetime(year=_PREDICTING_YEAR-1, month=1, day=1)
-    
-    # Calculate the full date and time from the decimal day
-    full_date_time = start_date + timedelta(days=decimal_day - 1)  # Subtract 1 because January 1st is day 1, not day 0
-    
-    # Format the date and time into month-day hour-minute format
-    formatted_date_time = full_date_time.strftime("%B %d, %I:%M %p")
-    
-    return formatted_date_time
+    start_date = datetime(year=_PREDICTING_YEAR - 1, month=1, day=1)
+    full_date_time = start_date + timedelta(days=decimal_day - 1)
+    return full_date_time.strftime("%B %d, %I:%M %p")
+
+
+def walk_forward_cv(X, y, alphas, min_train=10):
+    """
+    Walk-forward cross-validation: train on all years up to i, predict year i+1.
+    Returns mean absolute day error for each alpha value.
+    """
+    errors = {alpha: [] for alpha in alphas}
+    n = len(X)
+    for i in range(min_train, n):
+        X_tr, y_tr = X.iloc[:i], y.iloc[:i]
+        X_te, y_te = X.iloc[i : i + 1], y.iloc[i : i + 1]
+        for alpha in alphas:
+            scaler = StandardScaler()
+            X_tr_s = scaler.fit_transform(X_tr)
+            X_te_s = scaler.transform(X_te)
+            m = Ridge(alpha=alpha)
+            m.fit(X_tr_s, y_tr)
+            pred = m.predict(X_te_s)[0]
+            errors[alpha].append(abs(pred - y_te.values[0]))
+    return {alpha: np.mean(errs) for alpha, errs in errors.items()}
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Reads a path to a CSV and a YAML file."
-    )
-    parser.add_argument(
-        "--csv_path", type=str, required=False, default="NenanaIceClassic_1917-2021.csv"
-    )
-    parser.add_argument("--num_lags", type=int, required=False, default=5)
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv_path", type=str, default="NenanaIceClassic_1917-2021.csv")
     args = parser.parse_args()
 
-    num_lags = args.num_lags
+    df = pd.read_csv(args.csv_path)
+    df = df[df["Year"] >= 1989].reset_index(drop=True)
 
-    # Read CSV file
-    try:
-        df_nenana = pd.read_csv(args.csv_path)
-        print("CSV file loaded successfully.")
-    except Exception as e:
-        print(f"Error loading CSV file: {e}")
+    # Derived feature: rate of ice change between Feb and March
+    df["ice_change"] = df["Latest March Ice Reading"] - df["Latest Feb Ice Reading"]
 
-    df_full = df_nenana[72:].reset_index(drop=True)
+    # Lagged breakup day (prior year's melt date as autoregressive feature)
+    df["prior_melt"] = df["Decimal Day of Year"].shift(1)
+    df = df.iloc[1:].reset_index(drop=True)  # drop 1989 row (no prior_melt)
 
-    prior_melt = []
-    for idx, row in df_full.iterrows():
-        if idx == 0:
-            continue
-        else:
-            prior_melt.append(df_full.iloc[idx - 1]["Decimal Day of Year"])
-    df_full = df_full[1:]
-    df_full["prior_melt"] = prior_melt
-    df_train = df_full[:22]
-    df_val = df_full[22:]
+    df_known = df[df["Decimal Day of Year"].notna()].copy()   # 1990–2025
+    df_predict = df[df["Decimal Day of Year"].isna()].copy()  # 2026
 
-    model = AutoReg(
-        endog=df_train["Decimal Day of Year"],
-        lags=num_lags,
-        exog=df_train[TRAIN_COLUMNS],
+    X = df_known[FEATURE_COLUMNS].astype(float)
+    y = df_known["Decimal Day of Year"]
+
+    # --- Walk-forward cross-validation to select regularization strength ---
+    # min_train=15 so each fold has enough data; predicts years 2005–2025 (21 folds)
+    alphas = [0.1, 1, 10, 100, 1000]
+    cv_errors = walk_forward_cv(X, y, alphas, min_train=15)
+
+    print("Walk-forward CV mean absolute day errors (min_train=15, predicting 2005–2025):")
+    for alpha in sorted(alphas):
+        marker = " <-- best" if alpha == min(cv_errors, key=cv_errors.get) else ""
+        print(f"  Ridge(alpha={alpha:6}): {cv_errors[alpha]:.3f} days{marker}")
+
+    best_alpha = min(cv_errors, key=cv_errors.get)
+    print(f"\nBaseline OLS old features (walk-forward CV): ~5.70 days")
+    print(f"Ridge(alpha={best_alpha}) new features:       {cv_errors[best_alpha]:.3f} days")
+
+    # --- Fit final model on all 1990–2025 data ---
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    model = Ridge(alpha=best_alpha)
+    model.fit(X_scaled, y)
+
+    print("\nFeature coefficients (standardized — larger |coef| = more predictive):")
+    for feat, coef in sorted(zip(FEATURE_COLUMNS, model.coef_), key=lambda x: abs(x[1]), reverse=True):
+        direction = "earlier melt" if coef < 0 else "later melt"
+        print(f"  {feat:30s}: {coef:+.3f}  ({direction})")
+
+    # --- Predict 2026 ---
+    X_pred = df_predict[FEATURE_COLUMNS].astype(float)
+    X_pred_scaled = scaler.transform(X_pred)
+    pred = model.predict(X_pred_scaled)[0]
+    date_str = convert_decimal_day_to_date(pred)
+    print(f"\n{_PREDICTING_YEAR} prediction: {date_str}  (decimal day {pred:.3f})")
+
+    # --- Plot walk-forward CV predictions vs actuals ---
+    _plot_results(X, y, df_known, best_alpha, cv_errors[best_alpha], pred)
+
+
+def _plot_results(X, y, df_known, best_alpha, cv_error, pred_2026):
+    min_train = 15
+    n = len(X)
+    preds, actuals, years = [], [], []
+
+    for i in range(min_train, n):
+        scaler_i = StandardScaler()
+        X_tr_s = scaler_i.fit_transform(X.iloc[:i])
+        X_te_s = scaler_i.transform(X.iloc[i : i + 1])
+        m = Ridge(alpha=best_alpha)
+        m.fit(X_tr_s, y.iloc[:i])
+        preds.append(m.predict(X_te_s)[0])
+        actuals.append(y.iloc[i])
+        years.append(int(df_known["Year"].values[i]))
+
+    preds = np.array(preds)
+    actuals = np.array(actuals)
+    errors = np.abs(actuals - preds)
+    ci = 1.96 * np.std(errors) / np.sqrt(len(errors))
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.fill_between(years, preds - ci, preds + ci, color="tomato", alpha=0.2, label="95% CI")
+    ax.plot(years, actuals, "o-", color="steelblue", label="Actual breakup")
+    ax.plot(years, preds, "s--", color="tomato", label="Walk-forward CV prediction")
+    # Annotate error per year
+    for yr, p, e in zip(years, preds, errors):
+        ax.annotate(f"{e:.1f}", (yr, p), textcoords="offset points", xytext=(0, 7), fontsize=7, ha="center")
+    # Mark 2026 prediction
+    ax.axvline(_PREDICTING_YEAR, color="green", linestyle=":", alpha=0.7)
+    ax.scatter([_PREDICTING_YEAR], [pred_2026], color="green", zorder=5, s=80,
+               label=f"{_PREDICTING_YEAR} pred: {convert_decimal_day_to_date(pred_2026)}")
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Decimal Day of Year")
+    ax.set_title(
+        f"Ridge regression (alpha={best_alpha}) + ENSO/AO/PDO climate indices\n"
+        f"Walk-forward CV mean day error: {cv_error:.2f}  |  Baseline (AutoReg lag=3): 2.86 days"
     )
-
-    model_fit = model.fit()
-    y_preds = model_fit.predict(
-        start=1, end=len(df_val), exog_oos=df_val[TRAIN_COLUMNS]
-    )
-
-    # -1 to account for 2024
-    mse = mean_squared_error(
-        df_val["Decimal Day of Year"].values[num_lags - 1 :][:-1],
-        y_preds[num_lags - 1 :].values[:-1],
-    )
-    print(f"Mean Squared Error: {mse:.2f}")
-    mean_day_error = np.mean(
-        abs(
-            df_val["Decimal Day of Year"].values[num_lags - 1 :][:-1]
-            - y_preds[num_lags - 1 :].values[:-1]
-        )
-    )
-    print(f"Mean Day Error: {mean_day_error:.2f}")
-
-    plt.figure()
-    plt.scatter(df_full["Latest March Ice Reading"].values[:-1], df_full["Decimal Day of Year"].values[:-1], color='b')
-    plt.xlabel('March Ice Thickness')
-    plt.ylabel('Decimal Day of Year')
-    plt.savefig('Ice Reading vs Decimal Day of Year.png')
-
-    plt.figure()
-    actual_years = df_val["Year"].values[(num_lags - 1) :]
-    actual_values = df_val["Decimal Day of Year"].values[num_lags - 1 :]
-    predicted_values = y_preds[num_lags - 1 :].values
-    error = abs(actual_values[:-1] - predicted_values[:-1])
-    # Calculate the 95% confidence interval
-    confidence_interval = 1.96 * np.std(error) / np.sqrt(len(error))
-    print(confidence_interval)
-    lower_bound = predicted_values - confidence_interval
-    upper_bound = predicted_values + confidence_interval
-    plt.fill_between(actual_years, lower_bound, upper_bound, color='r', alpha=0.2, label='95% Confidence Interval')
-    plt.plot(actual_years, actual_values, 'o-', color='b', label='Actual Melt')
-    plt.legend()
-    plt.xlabel("Year")
-    plt.ylabel("Decimal Day of Year")
-    date_pred_year = convert_decimal_day_to_date(y_preds.values[-1])
-
-    plt.title(f"Mean Squared Error: {mse:.2f}, Mean Day Error: {mean_day_error:.2f}\n2024 prediction: {date_pred_year}")
-    for i, txt in enumerate(error):
-        plt.annotate(f"{txt:.2f}", (actual_years[i], predicted_values[i]))
-    plt.savefig("auto_reg_results_with_confidence_interval.png")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig("ridge_results_walk_forward_cv.png")
+    plt.close()
+    print("Saved: ridge_results_walk_forward_cv.png")
 
 
 if __name__ == "__main__":
